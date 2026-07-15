@@ -18,22 +18,27 @@ This plugin adds:
 You'll need [Node.js](https://nodejs.org) 20+ and the
 [Just Call Me: Agent Callbacks](https://getjustcall.me) app on your iPhone.
 
-In Claude Code (desktop or CLI):
+> **Install on a Claude Code session running on your computer** — the terminal,
+> the desktop app, or an IDE extension — **not a cloud/web session.** The plugin
+> does its work on your machine; a cloud sandbox can't ring you about it.
+
+**In the Claude Code terminal:**
 
 ```
 /plugin marketplace add LunaNiermann/justcallme-plugin
 /plugin install justcallme@justcallme
-```
-
-Then link this computer to your account:
-
-```
 /callme link
 ```
 
-It checks your machine, walks you through getting the iPhone app, and shows a QR
-code — scan it, tap **Confirm**, and you're done. No keys to copy, no environment
-variables, no config files to edit.
+**In the desktop app or an IDE**, where slash commands may not exist, just ask
+Claude in plain language:
+
+> Add the plugin marketplace LunaNiermann/justcallme-plugin, install the
+> justcallme plugin, then run callme link.
+
+`link` checks your machine, walks you through getting the iPhone app, and gives
+you a link + short code (and a QR where it renders) — open it on your phone, tap
+**Confirm**, done. No keys to copy, no environment variables, no config files.
 
 ## Everyday use
 

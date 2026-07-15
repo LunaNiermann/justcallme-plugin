@@ -22,7 +22,7 @@ const DEFAULTS = {
   /** Master switch. Off = never call, whatever else says. */
   enabled: true,
   /** Don't call for anything shorter than this. 0 = call for everything. */
-  minSeconds: 120,
+  minSeconds: 600,
   /**
    * Per-project overrides, keyed by project name (the basename of the cwd).
    * { "payments": { "enabled": true, "minSeconds": 0 } }

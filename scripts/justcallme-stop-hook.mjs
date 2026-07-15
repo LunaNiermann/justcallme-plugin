@@ -11,7 +11,7 @@
  *   JUSTCALLME_API_URL       required — https://<your-api>.onrender.com
  *   JUSTCALLME_API_KEY       required — the jcm_… key from the app
  *   JUSTCALLME_MIN_SECONDS   optional — don't call for tasks shorter than this
- *                                       (default 120; set 0 to always call)
+ *                                       (default 600 = 10 min; set 0 to always call)
  *   JUSTCALLME_DEBUG         optional — set to 1 to log what it's doing
  *
  * Hooks must never break the user's session, so this exits 0 no matter what.
@@ -33,7 +33,7 @@ const SETTLE_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'justcallme-
 
 // Env wins; ~/.justcallme/config.json (written by `/callme pair`) is the fallback.
 const { apiUrl: API_URL, apiKey: API_KEY } = resolveCreds();
-const MIN_SECONDS = Number(process.env.JUSTCALLME_MIN_SECONDS ?? 120);
+const MIN_SECONDS = Number(process.env.JUSTCALLME_MIN_SECONDS ?? 600);
 const DEBUG = process.env.JUSTCALLME_DEBUG === '1';
 
 // Set by `justcallme listen` on the runs *it* spawns, so the chain can be

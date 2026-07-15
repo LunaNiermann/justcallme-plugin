@@ -215,13 +215,21 @@ async function startPairing(apiUrl) {
 function printPairQr(webUrl, code) {
   // `?c=`, not `?code=`: supabase-js owns `?code=` on that page (PKCE) and
   // strips it during a magic-link sign-in, eating the pairing code with it.
+  //
+  // Link and code come FIRST: chat UIs (Claude desktop, IDEs) render the
+  // half-block QR with broken line-height and it won't scan there — the URL is
+  // the path that works everywhere. The QR is a bonus for real terminals.
   const url = `${webUrl}/pair?c=${code}`;
-  console.log('  Scan this with your phone:');
+  console.log('  On your phone, open:');
+  console.log('');
+  console.log(`      ${url}`);
+  console.log('');
+  console.log(`  and check the code matches:   ${code}`);
+  console.log(`  (or go to ${webUrl}/pair and type the code in)`);
+  console.log('');
+  console.log('  In a terminal you can also scan this:');
   console.log('');
   console.log(renderQr(url).replace(/^/gm, '  '));
-  console.log('');
-  console.log(`  or open   ${url}`);
-  console.log(`  and check the code matches:   ${code}`);
   console.log('');
 }
 
@@ -437,10 +445,17 @@ async function linkWait() {
     return;
   }
 
-  console.log('  You\'re linked. Try it:');
+  console.log('  You\'re linked. Here\'s everything you can do:');
   console.log('');
-  console.log('    /callme status   ← see what\'s armed and what the thresholds are');
-  console.log('    /callme once     ← "ring me when THIS task finishes"');
+  console.log('    /callme once               ring me when THIS task finishes — the one you\'ll use');
+  console.log('    /callme on | off           calls on/off for the current project (new projects');
+  console.log('                               are silent until you turn them on)');
+  console.log('    /callme threshold 300      only call for tasks over 5 minutes (default 10)');
+  console.log('    /callme quiet 22:00 08:00  no calls at night — a `once` still gets through');
+  console.log('    /callme status             what\'s armed, on, and thresholded');
+  console.log('    /callme doctor             would a call actually reach your phone?');
+  console.log('');
+  console.log('  Or just say it: "call me when this is done" works too.');
   console.log('');
 }
 
