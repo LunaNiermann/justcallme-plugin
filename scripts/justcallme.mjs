@@ -180,15 +180,18 @@ async function upgrade() {
  * ~/.justcallme/config.json, where the hook, the listener, and this CLI all
  * find it — no env vars, no new terminal needed.
  */
-async function pair() {
-  const DEFAULT_API = 'https://justcallme-api.onrender.com';
-  const DEFAULT_WEB = 'https://getjustcall.me';
-  const apiUrl = (process.env.JUSTCALLME_API_URL ?? resolveCreds().apiUrl ?? DEFAULT_API).replace(/\/$/, '');
-  const webUrl = (process.env.JUSTCALLME_WEB_URL ?? DEFAULT_WEB).replace(/\/$/, '');
+const DEFAULT_API = 'https://justcallme-api.onrender.com';
+const DEFAULT_WEB = 'https://getjustcall.me';
 
-  console.log('');
+function pairUrls() {
+  return {
+    apiUrl: (process.env.JUSTCALLME_API_URL ?? resolveCreds().apiUrl ?? DEFAULT_API).replace(/\/$/, ''),
+    webUrl: (process.env.JUSTCALLME_WEB_URL ?? DEFAULT_WEB).replace(/\/$/, ''),
+  };
+}
 
-  let session;
+/** POST /pair/start → { code, poll_secret, expires_in_seconds } | null (printed why). */
+async function startPairing(apiUrl) {
   try {
     const res = await fetch(`${apiUrl}/pair/start`, {
       method: 'POST',
@@ -199,36 +202,41 @@ async function pair() {
     if (!res.ok) {
       console.log(`  Couldn't start pairing (${res.status}). Is the API up?`);
       console.log('');
-      return false;
+      return null;
     }
-    session = await res.json();
+    return await res.json();
   } catch (err) {
     console.log(`  Couldn't reach the API: ${err.message}`);
     console.log('');
-    return false;
+    return null;
   }
+}
 
-  const { code, poll_secret, expires_in_seconds } = session;
+function printPairQr(webUrl, code) {
   // `?c=`, not `?code=`: supabase-js owns `?code=` on that page (PKCE) and
   // strips it during a magic-link sign-in, eating the pairing code with it.
-  const pairUrl = `${webUrl}/pair?c=${code}`;
-
+  const url = `${webUrl}/pair?c=${code}`;
   console.log('  Scan this with your phone:');
   console.log('');
-  console.log(renderQr(pairUrl).replace(/^/gm, '  '));
+  console.log(renderQr(url).replace(/^/gm, '  '));
   console.log('');
-  console.log(`  or open   ${pairUrl}`);
+  console.log(`  or open   ${url}`);
   console.log(`  and check the code matches:   ${code}`);
   console.log('');
-  console.log('  Waiting for you to confirm on your phone…');
+}
 
-  const deadline = Date.now() + expires_in_seconds * 1000;
+/**
+ * Poll until the phone confirms. Returns true (key saved) or false.
+ * `deadline` is epoch ms — the session's expiry, or sooner if the caller has a
+ * shorter patience (a tool-run under Claude shouldn't block for the full TTL).
+ */
+async function pollForKey({ apiUrl, code, pollSecret, deadline }) {
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 3000));
     let res;
     try {
       res = await fetch(`${apiUrl}/pair/${code}/poll`, {
-        headers: { 'x-poll-secret': poll_secret },
+        headers: { 'x-poll-secret': pollSecret },
         signal: AbortSignal.timeout(15_000),
       });
     } catch {
@@ -250,6 +258,30 @@ async function pair() {
     console.log('  Paired ✓  The key is saved in ~/.justcallme/config.json — the hook,');
     console.log('  the listener, and /callme all use it from there automatically.');
     console.log('');
+    return true;
+  }
+  return false;
+}
+
+async function pair() {
+  const { apiUrl, webUrl } = pairUrls();
+  console.log('');
+
+  const session = await startPairing(apiUrl);
+  if (!session) return false;
+
+  const { code, poll_secret, expires_in_seconds } = session;
+  // `?c=`, not `?code=`: supabase-js owns `?code=` on that page (PKCE) and
+  printPairQr(webUrl, code);
+  console.log('  Waiting for you to confirm on your phone…');
+
+  const paired = await pollForKey({
+    apiUrl,
+    code,
+    pollSecret: poll_secret,
+    deadline: Date.now() + expires_in_seconds * 1000,
+  });
+  if (paired) {
     console.log('  Check the whole chain with:  justcallme.mjs doctor');
     console.log('');
     return true;
@@ -264,10 +296,15 @@ async function pair() {
 /**
  * `link` — the guided first-run. This is the front door for a new user who just
  * installed the plugin: sanity-check the machine, point them at the iOS app,
- * then run the QR pairing. It's `pair` with a pre-flight and a welcome mat.
+ * then start the QR pairing.
  *
- * Deliberately NOT interactive: it prints, shows the QR, and waits. The one
- * action it needs from the user happens on their PHONE, not at this keyboard.
+ * TWO steps on purpose: `link` prints the QR and EXITS; `link wait` polls for
+ * the confirmation. When Claude runs these as tool calls, the user only sees a
+ * command's output once it finishes — a single command that prints the QR and
+ * then blocks would show the QR to nobody while it waits for a scan of it.
+ * (Exactly that shipped first: the API logged poll after poll for a code no
+ * human had ever seen.) The pending session is stashed in the config file so
+ * `link wait` — a separate process — can pick it up.
  */
 async function link() {
   const ok = (m) => console.log(`  [OK]   ${m}`);
@@ -339,8 +376,66 @@ async function link() {
   console.log('     (Already done? Carry straight on.)');
   console.log('');
 
-  const paired = await pair();
-  if (paired === false) return;
+  const { webUrl } = pairUrls();
+  const session = await startPairing(apiUrl);
+  if (!session) return;
+
+  printPairQr(webUrl, session.code);
+
+  // Stash the session so `link wait` (a separate process) can poll for it.
+  const config = loadConfig();
+  config.pendingPair = {
+    apiUrl,
+    code: session.code,
+    pollSecret: session.poll_secret,
+    expiresAt: Date.now() + session.expires_in_seconds * 1000,
+  };
+  saveConfig(config);
+
+  console.log('  The code is valid for 10 minutes. Once you have scanned and confirmed');
+  console.log('  on your phone, finish with:   link wait');
+}
+
+/** `link wait` — poll the pending pairing session until the phone confirms. */
+async function linkWait() {
+  const config = loadConfig();
+  const pending = config.pendingPair;
+
+  console.log('');
+  if (!pending?.code || !pending?.pollSecret) {
+    console.log('  No pairing in progress. Start one with:  link');
+    console.log('');
+    return;
+  }
+  if (Date.now() >= pending.expiresAt) {
+    delete config.pendingPair;
+    saveConfig(config);
+    console.log('  That pairing code has expired (they live 10 minutes).');
+    console.log('  Start a fresh one with:  link');
+    console.log('');
+    return;
+  }
+
+  console.log(`  Waiting for you to confirm code ${pending.code} on your phone…`);
+
+  const paired = await pollForKey({
+    apiUrl: pending.apiUrl,
+    code: pending.code,
+    pollSecret: pending.pollSecret,
+    deadline: pending.expiresAt,
+  });
+
+  // RELOAD before clearing: pollForKey just wrote the api key through its own
+  // load/save, and saving our pre-poll snapshot would silently erase it.
+  const fresh = loadConfig();
+  delete fresh.pendingPair; // one-shot either way — a dead session is not worth keeping
+  saveConfig(fresh);
+
+  if (!paired) {
+    console.log('  Not confirmed in time. Start a fresh code with:  link');
+    console.log('');
+    return;
+  }
 
   console.log('  You\'re linked. Try it:');
   console.log('');
@@ -368,7 +463,8 @@ switch (cmd) {
     break;
 
   case 'link':
-    await link();
+    if (args[0] === 'wait') await linkWait();
+    else await link();
     break;
 
   // The one that matters. You're about to start something slow.

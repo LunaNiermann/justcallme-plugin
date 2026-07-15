@@ -13,11 +13,21 @@ arguments, run `status`.
 node "${CLAUDE_PLUGIN_ROOT}/scripts/justcallme.mjs" $ARGUMENTS
 ```
 
-For `link` and `pair`, pass a Bash timeout of 600000 (10 minutes) — the command
-waits while the user scans a QR code with their phone, and the default timeout
-would cut it off mid-wait. Relay the CLI's output faithfully, including the QR
-code block, exactly as printed (it must stay monospaced and unmangled or it won't
-scan).
+## Linking is TWO commands, in order — this matters
+
+`link` prints a QR code and exits; `link wait` blocks until the user has scanned
+it. Never skip straight to `link wait`, and never expect `link` itself to wait.
+
+1. Run `link`. **Relay its output to the user immediately and verbatim** —
+   especially the QR code block, exactly as printed, monospaced and unmangled
+   (it must scan off the screen). Tell them to scan it with their iPhone camera
+   and tap Confirm.
+2. Then run `link wait` with a Bash timeout of 600000 (10 minutes). It returns
+   the moment they confirm on the phone. If it times out or reports expiry, run
+   `link` again for a fresh code.
+
+`pair` (without the checks) blocks in one step and is for humans at a real
+terminal — prefer `link` + `link wait` when you are driving.
 
 The CLI reads the **current working directory** to know which project it's acting on,
 so run it from wherever the user already is — do NOT `cd` anywhere first.
@@ -29,9 +39,11 @@ asked for `status`.
 
 - **`link`** — the guided first-run: checks the machine, points the user at the iOS
   app ("Just Call Me: Agent Callbacks" on the App Store), then shows a QR code to
-  pair this computer with their account. If the user just installed this plugin, or
-  says "set this up" / "get me started", run this. Safe to re-run: it detects an
-  existing link and says so.
+  pair this computer with their account. Follow with `link wait` (see above). If the
+  user just installed this plugin, or says "set this up" / "get me started", run
+  this. Safe to re-run: it detects an existing link and says so.
+- **`link wait`** — step two of linking: waits (up to 10 min) for the user to
+  confirm the scanned code on their phone. Only meaningful right after `link`.
 - **`once`** — the important one. "Ring me when *this* task finishes", regardless of
   threshold, quiet hours, or the master switch. The user is about to start something
   slow and is walking away. It fires exactly once and disarms itself.
