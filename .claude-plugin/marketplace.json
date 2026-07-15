@@ -1,0 +1,14 @@
+{
+  "name": "justcallme",
+  "owner": {
+    "name": "Just Call Me",
+    "url": "https://getjustcall.me"
+  },
+  "plugins": [
+    {
+      "name": "justcallme",
+      "source": "./",
+      "description": "Your coding agent phones you when the work is done — /callme command + the Stop hook that rings your iPhone after long tasks."
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "justcallme",
+  "description": "Just Call Me — your coding agent phones you when the work is done. Adds the /callme command and the Stop hook that rings your iPhone after long tasks.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Just Call Me",
+    "url": "https://getjustcall.me"
+  },
+  "homepage": "https://getjustcall.me",
+  "keywords": ["voice", "callback", "notifications", "phone", "callkit"]
+}
