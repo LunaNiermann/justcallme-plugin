@@ -16,10 +16,15 @@ import { loadConfig, saveConfig } from './config.mjs';
 
 const DEFAULT_API_URL = 'https://justcallme-api.onrender.com';
 
-/** @returns {{ apiUrl: string|undefined, apiKey: string|undefined, source: string }} */
-export function resolveCreds() {
-  const envUrl = process.env.JUSTCALLME_API_URL?.replace(/\/$/, '');
-  const envKey = process.env.JUSTCALLME_API_KEY;
+/**
+ * @param {{ ignoreEnv?: boolean }} [opts] ignoreEnv reads the config file only —
+ *   used to recover when an exported key turns out to be dead (env normally wins,
+ *   which is exactly the problem being recovered from).
+ * @returns {{ apiUrl: string|undefined, apiKey: string|undefined, source: string }}
+ */
+export function resolveCreds(opts = {}) {
+  const envUrl = opts.ignoreEnv ? undefined : process.env.JUSTCALLME_API_URL?.replace(/\/$/, '');
+  const envKey = opts.ignoreEnv ? undefined : process.env.JUSTCALLME_API_KEY;
   if (envUrl && envKey) return { apiUrl: envUrl, apiKey: envKey, source: 'env' };
 
   const config = loadConfig();

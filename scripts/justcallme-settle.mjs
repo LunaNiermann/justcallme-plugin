@@ -104,17 +104,30 @@ while (Date.now() < deadline) {
 // Nothing happened for the whole window. The session is idle. Ring.
 log('session settled — calling');
 
-try {
-  const res = await fetch(`${job.apiUrl}/notify`, {
+const postNotify = (key) =>
+  fetch(`${job.apiUrl}/notify`, {
     method: 'POST',
-    headers: {
-      // env → job file → paired key in ~/.justcallme/config.json.
-      authorization: `Bearer ${process.env.JUSTCALLME_API_KEY ?? job.apiKey ?? resolveCreds().apiKey}`,
-      'content-type': 'application/json',
-    },
+    headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
     body: JSON.stringify(job.body),
     signal: AbortSignal.timeout(20_000),
   });
+
+try {
+  // env → job file → paired key in ~/.justcallme/config.json.
+  const envKey = process.env.JUSTCALLME_API_KEY ?? job.apiKey;
+  const pairedKey = resolveCreds({ ignoreEnv: true }).apiKey;
+
+  let res = await postNotify(envKey ?? pairedKey);
+
+  // The single most common way the phone stops ringing: a long-lived shell (or
+  // the Claude session it spawned) still exports a key that has since been
+  // revoked, and env outranks the config file. If the env key bounces and a
+  // DIFFERENT paired key exists, the paired one is almost certainly the live
+  // one — retry with it rather than silently not ringing.
+  if (res.status === 401 && envKey && pairedKey && pairedKey !== envKey) {
+    log('env API key rejected — retrying with the paired key from config.json');
+    res = await postNotify(pairedKey);
+  }
 
   const text = await res.text();
   if (res.ok) {
@@ -122,8 +135,8 @@ try {
   } else if (res.status === 401) {
     // Worth being loud about: a dead key means the phone silently never rings again.
     console.error(
-      '[justcallme] API key rejected (401). Mint a new one in the app and update ' +
-        'JUSTCALLME_API_KEY. Run `justcallme.mjs doctor` to check.',
+      '[justcallme] API key rejected (401). Re-pair this machine (`/callme pair`) or ' +
+        'clear the stale JUSTCALLME_API_KEY from your environment. `justcallme.mjs doctor` checks.',
     );
   } else if (res.status === 402) {
     // Out of free minutes. This process is detached, so its stderr may go unseen —
