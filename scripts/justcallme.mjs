@@ -362,12 +362,16 @@ async function link() {
     return;
   }
 
-  // Already linked? Don't pair again silently — say so.
-  const existing = resolveCreds();
-  if (existing.apiKey) {
+  // Already linked? Don't pair again silently — say so. Check BOTH candidate
+  // keys: env first, then the paired key in config.json — a stale exported key
+  // must not hide a perfectly good paired one (it did: link re-paired machines
+  // that were already linked, because the dead env key outranked the live key).
+  const candidates = [resolveCreds().apiKey, resolveCreds({ ignoreEnv: true }).apiKey]
+    .filter((k, i, all) => k && all.indexOf(k) === i);
+  for (const key of candidates) {
     try {
       const res = await fetch(`${apiUrl}/keys/verify`, {
-        headers: { authorization: `Bearer ${existing.apiKey}` },
+        headers: { authorization: `Bearer ${key}` },
         signal: AbortSignal.timeout(15_000),
       });
       if (res.ok) {
@@ -380,7 +384,7 @@ async function link() {
         return;
       }
     } catch {
-      /* verification failed — fall through and pair fresh */
+      /* verification failed — try the next candidate, else pair fresh */
     }
   }
 

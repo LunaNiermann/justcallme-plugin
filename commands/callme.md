@@ -19,12 +19,18 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/justcallme.mjs" $ARGUMENTS
 it. Never skip straight to `link wait`, and never expect `link` itself to wait.
 
 1. Run `link`. **Relay its output to the user immediately and verbatim** —
-   especially the QR code block, exactly as printed, monospaced and unmangled
-   (it must scan off the screen). Tell them to scan it with their iPhone camera
-   and tap Confirm.
-2. Then run `link wait` with a Bash timeout of 600000 (10 minutes). It returns
-   the moment they confirm on the phone. If it times out or reports expiry, run
-   `link` again for a fresh code.
+   especially the pairing URL and six-character code (and the QR block exactly
+   as printed, monospaced). Tell them to open the link or scan, check the code
+   matches, and tap Confirm.
+2. Then run `link wait` **in the background** (run_in_background: true) and END
+   YOUR TURN with the link/code visible in your message. This matters: your text
+   only renders when your turn ends, so a FOREGROUND `link wait` blocks for
+   minutes while the user stares at a spinner with no link ever shown. The
+   background task notifies you when they confirm — then report the result.
+   If your environment cannot run background commands, end your turn after
+   relaying the link and run `link wait` (600000ms timeout) only AFTER the user
+   says they've scanned.
+3. If it reports expiry, run `link` again for a fresh code.
 
 `pair` (without the checks) blocks in one step and is for humans at a real
 terminal — prefer `link` + `link wait` when you are driving.
