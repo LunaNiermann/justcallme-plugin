@@ -503,6 +503,12 @@ async function linkWait() {
  *                 isolated worktree on a justcallme/* branch (never merged,
  *                 never pushed). Starts the helper daemon and registers it to
  *                 start at login, so there is no terminal to babysit.
+ *   away on --full-auto
+ *                 same, but Claude runs shell commands without prompting, so
+ *                 command-driven tasks (tests, builds, git) actually complete.
+ *                 Powerful and dangerous — see the warning it prints.
+ *   away on --safe  go back to edits-only (auto-accept file edits, prompt for
+ *                 everything else). The default.
  *   away off      this project always waits for you, whatever the app toggle says
  *   away clear    remove this project's override (the app toggle decides again)
  *   away status   is the helper alive, what's opted in, where the log is
@@ -511,20 +517,35 @@ async function linkWait() {
  * overrides on this machine. Opting a project in also adds its directory to the
  * daemon's allowlist — the listener refuses to run anywhere it wasn't invited.
  */
-async function away(sub) {
+const SAFE_ARGS = '--permission-mode acceptEdits';
+const FULL_AUTO_ARGS = '--permission-mode bypassPermissions';
+const isFullAuto = (a) => /bypassPermissions/.test(a ?? '');
+const permissionLabel = (a) =>
+  isFullAuto(a) ? 'FULL AUTO — runs any command unattended' : 'safe — auto-accepts file edits only';
+
+async function away(sub, rest = []) {
   const cwd = process.cwd();
 
   console.log('');
 
   if (sub === 'on') {
+    // Opt in to (or out of) unattended shell commands. A plain `away on` preserves
+    // whatever level you already chose — and defaults to safe when unset — so it never
+    // silently upgrades your permissions. The flags are the only way to change level.
+    const wantFullAuto = rest.includes('--full-auto') || rest.includes('--yolo');
+    const wantSafe = rest.includes('--safe');
+
     config.projects[project] = { ...(config.projects[project] ?? {}), away: true };
     const dirs = new Set(Array.isArray(config.awayDirs) ? config.awayDirs : []);
     dirs.add(cwd);
     config.awayDirs = [...dirs];
-    // The setting that makes unattended runs actually run (edits auto-accepted;
-    // the isolation is the worktree + branch, and your review is the gate).
-    // Written into the config where you can see and change it, not hidden in an env.
-    config.claudeArgs ??= '--permission-mode acceptEdits';
+
+    // The setting that makes unattended runs actually run. Written into the config
+    // where you can see and change it, not hidden in an env. The isolation is the
+    // worktree + branch, and your review is the gate.
+    if (wantFullAuto) config.claudeArgs = FULL_AUTO_ARGS;
+    else if (wantSafe) config.claudeArgs = SAFE_ARGS;
+    else config.claudeArgs ??= SAFE_ARGS;
     saveConfig(config);
 
     const pid = startListener();
@@ -540,7 +561,18 @@ async function away(sub) {
     console.log(`  helper       running (pid ${pid})`);
     console.log(`  at login     ${auto}`);
     console.log(`  may run in   ${config.awayDirs.join(', ')}`);
+    console.log(`  permission   ${permissionLabel(config.claudeArgs)}`);
     console.log(`  log          ${LOG_FILE}`);
+
+    if (isFullAuto(config.claudeArgs)) {
+      console.log('');
+      console.log('  ⚠ FULL AUTO is on. Claude will run shell commands with NO prompt, from a');
+      console.log('    sentence you spoke into a phone and a speech recogniser heard. The');
+      console.log('    worktree keeps CODE off your real branch — but a command can still touch');
+      console.log('    anything on this machine (delete files, hit the network, spend money). A');
+      console.log('    misheard sentence becomes a command nobody approved. Run  /callme away on');
+      console.log('    --safe  to go back to edits-only.');
+    }
     console.log('');
     return;
   }
@@ -588,6 +620,7 @@ async function away(sub) {
   if (Array.isArray(config.awayDirs) && config.awayDirs.length) {
     console.log(`  may run in   ${config.awayDirs.join(', ')}`);
   }
+  if (config.claudeArgs) console.log(`  permission   ${permissionLabel(config.claudeArgs)}`);
   console.log(`  log          ${LOG_FILE}`);
   console.log('');
   console.log('  The app\'s Settings toggle is the default for projects without an override.');
@@ -602,7 +635,7 @@ switch (cmd) {
     break;
 
   case 'away':
-    await away(args[0] ?? 'status');
+    await away(args[0] ?? 'status', args.slice(1));
     break;
 
   case 'doctor':

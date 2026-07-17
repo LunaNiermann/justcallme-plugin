@@ -30,6 +30,8 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync } from 'no
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { resolveCreds } from './lib/creds.mjs';
+import { notifyDesktop } from './lib/notify-desktop.mjs';
+import { openSummaryWindow } from './lib/summary-window.mjs';
 
 const HOME = join(homedir(), '.justcallme');
 const INBOX = join(HOME, 'inbox');
@@ -88,32 +90,51 @@ try {
       .filter((x) => x && x.project === project);
 
     for (const item of items) {
-      parts.push(
-        [
-          `While you were away, you asked for this on a call and confirmed it out loud:`,
-          ``,
-          `  "${item.instruction}"`,
+      const lines = [
+        `While you were away, you asked for this on a call and confirmed it out loud:`,
+        ``,
+        `  "${item.instruction}"`,
+        ``,
+        item.changed
+          ? [
+              `It ran unattended and the work is on a branch — NOT merged, NOT pushed, and`,
+              `your working tree was never touched.`,
+              ``,
+              `  branch : ${item.branch}`,
+              `  base   : ${item.baseRef?.slice(0, 8)}`,
+              `  diff   : ${item.stat}`,
+              ``,
+              `Review it before trusting it. It was written from a voice instruction with`,
+              `nobody watching:`,
+              ``,
+              `  git diff ${item.baseRef?.slice(0, 8)}..${item.branch}`,
+            ].join('\n')
+          : [
+              `It ran but changed nothing (exit code ${item.exitCode}).`,
+              `Branch ${item.branch} exists but is empty.`,
+            ].join('\n'),
+      ];
+
+      // What Claude actually said. For a code change this is its own summary; for a
+      // question or a blocked command it IS the deliverable — the only place the answer
+      // lives, so it has to be surfaced here or it's lost in a daemon log.
+      if (item.output) {
+        lines.push(
           ``,
           item.changed
-            ? [
-                `It ran unattended and the work is on a branch — NOT merged, NOT pushed, and`,
-                `your working tree was never touched.`,
-                ``,
-                `  branch : ${item.branch}`,
-                `  base   : ${item.baseRef?.slice(0, 8)}`,
-                `  diff   : ${item.stat}`,
-                ``,
-                `Review it before trusting it. It was written from a voice instruction with`,
-                `nobody watching:`,
-                ``,
-                `  git diff ${item.baseRef?.slice(0, 8)}..${item.branch}`,
-              ].join('\n')
-            : [
-                `It ran but changed nothing (exit code ${item.exitCode}).`,
-                `Branch ${item.branch} exists but is empty.`,
-              ].join('\n'),
-        ].join('\n'),
-      );
+            ? `What it reported when it finished:`
+            : `It changed no files, but here is what it said — this may be the answer you` +
+                ` asked for, or the reason nothing changed (e.g. a command it wasn't` +
+                ` allowed to run unattended):`,
+          ``,
+          item.output
+            .split('\n')
+            .map((l) => `  ${l}`)
+            .join('\n'),
+        );
+      }
+
+      parts.push(lines.join('\n'));
 
       // Move it out of the inbox so it's reported exactly once.
       try {
@@ -160,6 +181,27 @@ try {
             `  "${instruction}"`,
             ``,
             `Ask the user whether they still want it before doing anything.`,
+          ].join('\n'),
+        );
+
+        // You just sat down and opened Claude Code — the "at my desk" moment the safe-
+        // mode reminder is named for. Surface it on the desktop too, exactly like an
+        // away-mode result: a toast plus a window that stays open. No daemon and no
+        // polling — this rides the session-start hook, so it costs nothing when the
+        // queue is empty.
+        notifyDesktop(
+          'Just Call Me — reminder',
+          `${instruction}\nYou asked for this on a call — it's waiting for you.`,
+        );
+        openSummaryWindow(
+          [
+            'Just Call Me — reminder',
+            new Date().toLocaleString(),
+            '',
+            'You asked for this on a call, and it has been waiting for you:',
+            `  "${instruction}"`,
+            '',
+            'You are at your desk now — Claude Code will offer to run it in this session.',
           ].join('\n'),
         );
       }

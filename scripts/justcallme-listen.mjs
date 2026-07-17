@@ -51,6 +51,8 @@ import { resolveClaudeBin } from './lib/claude-bin.mjs';
 import { loadConfig } from './lib/config.mjs';
 import { resolveCreds } from './lib/creds.mjs';
 import { PID_FILE } from './lib/daemon.mjs';
+import { notifyDesktop } from './lib/notify-desktop.mjs';
+import { openSummaryWindow } from './lib/summary-window.mjs';
 import { commitWork, createWorktree, isGitRepo, removeWorktree } from './lib/worktree.mjs';
 
 /** Where finished work is left for you to review when you sit back down. */
@@ -141,7 +143,14 @@ async function apiGetOrNull(path) {
 
 // ---------------------------------------------------------------------------
 
-/** Spawn `claude -p` in a directory and wait. */
+/** The most of Claude's final answer we keep for the review handoff. `claude -p`
+ *  prints the final message to stdout; on a question or a blocked command that text
+ *  is the ONLY result there is, so it has to reach you — but it also mustn't bloat the
+ *  inbox file, so we keep the tail (where the conclusion lands). */
+const MAX_OUTPUT_CHARS = 8000;
+
+/** Spawn `claude -p` in a directory and wait. Resolves `{ code, output }`, where
+ *  `output` is Claude's captured stdout (its final answer). */
 function runClaude({ instruction, dir, project, chainDepth }) {
   return new Promise((done) => {
     const args = ['-p', instruction, ...(EXTRA_ARGS ? EXTRA_ARGS.split(/\s+/) : [])];
@@ -162,18 +171,34 @@ function runClaude({ instruction, dir, project, chainDepth }) {
         // you're waiting for it.
         JUSTCALLME_MIN_SECONDS: '0',
       },
-      stdio: ['ignore', 'inherit', 'inherit'],
+      // stdout is PIPED (not inherited) so we can keep Claude's final answer for the
+      // review handoff — a question or a blocked command leaves its result here and
+      // nowhere else. We still echo every chunk to our own stdout, so the daemon log
+      // keeps the full record it always had. stderr stays inherited.
+      stdio: ['ignore', 'pipe', 'inherit'],
       // A concrete claude.exe path spawns directly (no shell → no arg-escaping
       // foot-gun). Only a bare-name fallback needs a shell to resolve a .cmd shim.
       shell: CLAUDE_USE_SHELL,
+      // No flickering console. The daemon is hidden, so a child console app would
+      // otherwise flash its own window open and shut mid-run — confusing, and it told
+      // you nothing. The persistent summary window (opened when the run finishes) is
+      // the deliberate, readable replacement.
+      windowsHide: true,
+    });
+
+    let output = '';
+    child.stdout?.on('data', (chunk) => {
+      process.stdout.write(chunk); // preserve the listener.log record
+      output += chunk.toString();
+      if (output.length > MAX_OUTPUT_CHARS) output = output.slice(-MAX_OUTPUT_CHARS);
     });
 
     child.on('error', (err) => {
       console.error(`  ✗ could not start ${CLAUDE_BIN}: ${err.message}`);
       console.error('    Set JUSTCALLME_CLAUDE_BIN to the full path of your claude executable.');
-      done(1);
+      done({ code: 1, output: '' });
     });
-    child.on('exit', (code) => done(code ?? 1));
+    child.on('exit', (code) => done({ code: code ?? 1, output: output.trim() }));
   });
 }
 
@@ -213,7 +238,7 @@ async function runInstruction({ instruction, cwd, project, chainDepth, callId })
   log(`▶ ${tree.branch}`);
   log(`  "${instruction}"`);
 
-  const code = await runClaude({ instruction, dir: tree.dir, project, chainDepth });
+  const { code, output } = await runClaude({ instruction, dir: tree.dir, project, chainDepth });
 
   let result = { changed: false, stat: '', sha: null };
   try {
@@ -230,6 +255,50 @@ async function runInstruction({ instruction, cwd, project, chainDepth, callId })
   } else {
     log(`  ✓ done, but nothing changed (exit ${code})`);
   }
+
+  // One timestamp, shared by the inbox record and the summary window, so they never
+  // disagree about when this finished.
+  const finishedAt = new Date();
+
+  // Pop a desktop toast the moment the branch lands. The SessionStart handoff only
+  // surfaces this when you next OPEN Claude Code here; the toast reaches you even if
+  // you're at the PC doing something else. Best-effort — never blocks the run.
+  notifyDesktop(
+    result.changed ? 'Just Call Me — branch ready to review' : 'Just Call Me — away task finished',
+    result.changed
+      ? `${tree.branch}\n${result.stat}`
+      : `${tree.branch}\nRan but changed nothing (exit ${code})`,
+  );
+
+  // …and a persistent window that stays open with the whole story. You asked for a
+  // callback, so you're owed a reply you can actually sit and read — every run gets
+  // one, whether or not it changed anything.
+  const summaryLines = [
+    'Just Call Me — away task finished',
+    finishedAt.toLocaleString(),
+    '',
+    'You asked, on a call:',
+    `  "${instruction}"`,
+    '',
+  ];
+  if (result.changed) {
+    summaryLines.push(
+      'Task done:',
+      output || '(Claude left no summary text.)',
+      '',
+      `Committed to ${tree.branch}`,
+      `  ${result.stat}`,
+      '',
+      `Review:  git diff ${tree.baseRef?.slice(0, 8)}..${tree.branch}`,
+    );
+  } else {
+    summaryLines.push(
+      `It ran but changed nothing (exit code ${code}).`,
+      `Branch ${tree.branch} exists but is empty.`,
+      ...(output ? ['', 'What it said:', output] : []),
+    );
+  }
+  openSummaryWindow(summaryLines.join('\n'));
 
   // Leave it in the inbox, so that when you next open Claude Code in this project it
   // can tell you what happened while you were out. See justcallme-session-start.mjs.
@@ -249,7 +318,10 @@ async function runInstruction({ instruction, cwd, project, chainDepth, callId })
           stat: result.stat,
           sha: result.sha,
           exitCode: code,
-          finishedAt: new Date().toISOString(),
+          // Claude's final answer. On a question or a command it couldn't run, this is
+          // the only result — the SessionStart hook surfaces it so it reaches you.
+          output: output || null,
+          finishedAt: finishedAt.toISOString(),
         },
         null,
         2,
