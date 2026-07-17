@@ -44,10 +44,21 @@ export function startListener() {
 
   mkdirSync(HOME, { recursive: true });
   const log = openSync(LOG_FILE, 'a');
+
+  // The daemon must behave identically whether started here or at login — and
+  // at login it has NO JUSTCALLME_* environment. So strip that env here too:
+  // otherwise it inherits whatever shell spawned it (a stale key exported
+  // months ago outranks the freshly paired one in config.json, and the daemon
+  // sits there polling 401s). Config.json is the daemon's single source.
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => !k.startsWith('JUSTCALLME_')),
+  );
+
   const child = spawn(process.execPath, [LISTENER], {
     detached: true,
     stdio: ['ignore', log, log],
     windowsHide: true,
+    env,
   });
   child.unref();
   return child.pid;
