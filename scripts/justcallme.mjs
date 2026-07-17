@@ -20,6 +20,15 @@ import { hostname } from 'node:os';
 import { basename } from 'node:path';
 import { CONFIG_PATH, inQuietHours, loadConfig, saveConfig } from './lib/config.mjs';
 import { resolveCreds, saveCreds } from './lib/creds.mjs';
+import {
+  LOG_FILE,
+  installAutostart,
+  isAutostartInstalled,
+  isListenerRunning,
+  startListener,
+  stopListener,
+  uninstallAutostart,
+} from './lib/daemon.mjs';
 import { renderQr } from './lib/qr.mjs';
 
 const [, , cmd, ...args] = process.argv;
@@ -459,10 +468,113 @@ async function linkWait() {
   console.log('');
 }
 
+/**
+ * `away` — "do it while I'm away", per project.
+ *
+ *   away on       this project's confirmed instructions run unattended, in an
+ *                 isolated worktree on a justcallme/* branch (never merged,
+ *                 never pushed). Starts the helper daemon and registers it to
+ *                 start at login, so there is no terminal to babysit.
+ *   away off      this project always waits for you, whatever the app toggle says
+ *   away clear    remove this project's override (the app toggle decides again)
+ *   away status   is the helper alive, what's opted in, where the log is
+ *
+ * The app's Settings toggle is the account-wide DEFAULT; these are per-project
+ * overrides on this machine. Opting a project in also adds its directory to the
+ * daemon's allowlist — the listener refuses to run anywhere it wasn't invited.
+ */
+async function away(sub) {
+  const cwd = process.cwd();
+
+  console.log('');
+
+  if (sub === 'on') {
+    config.projects[project] = { ...(config.projects[project] ?? {}), away: true };
+    const dirs = new Set(Array.isArray(config.awayDirs) ? config.awayDirs : []);
+    dirs.add(cwd);
+    config.awayDirs = [...dirs];
+    // The setting that makes unattended runs actually run (edits auto-accepted;
+    // the isolation is the worktree + branch, and your review is the gate).
+    // Written into the config where you can see and change it, not hidden in an env.
+    config.claudeArgs ??= '--permission-mode acceptEdits';
+    saveConfig(config);
+
+    const pid = startListener();
+    const auto = isAutostartInstalled() ? 'already set' : installAutostart();
+
+    console.log(`  Away mode ON for '${project}'.`);
+    console.log('');
+    console.log('  When you confirm an instruction on a call from this project, it runs');
+    console.log('  here unattended — in an isolated copy, on a justcallme/* branch that is');
+    console.log('  never merged or pushed. You review the branch when you are back; the');
+    console.log('  next Claude session here will point you at it.');
+    console.log('');
+    console.log(`  helper       running (pid ${pid})`);
+    console.log(`  at login     ${auto}`);
+    console.log(`  may run in   ${config.awayDirs.join(', ')}`);
+    console.log(`  log          ${LOG_FILE}`);
+    console.log('');
+    return;
+  }
+
+  if (sub === 'off' || sub === 'clear') {
+    if (sub === 'off') {
+      config.projects[project] = { ...(config.projects[project] ?? {}), away: false };
+    } else if (config.projects[project]) {
+      delete config.projects[project].away;
+    }
+    config.awayDirs = (Array.isArray(config.awayDirs) ? config.awayDirs : []).filter(
+      (d) => d !== cwd,
+    );
+    saveConfig(config);
+
+    console.log(
+      sub === 'off'
+        ? `  Away mode OFF for '${project}' — its instructions always wait for you.`
+        : `  Override cleared for '${project}' — the app's toggle decides again.`,
+    );
+
+    const anyAway = Object.values(config.projects ?? {}).some((r) => r.away === true);
+    if (!anyAway && config.awayDirs.length === 0) {
+      const stopped = stopListener();
+      uninstallAutostart();
+      if (stopped) console.log('  No projects left in away mode — helper stopped and unregistered.');
+    }
+    console.log('');
+    return;
+  }
+
+  // status (default)
+  const pid = isListenerRunning();
+  const awayProjects = Object.entries(config.projects ?? {})
+    .filter(([, r]) => r.away === true)
+    .map(([p]) => p);
+  const askProjects = Object.entries(config.projects ?? {})
+    .filter(([, r]) => r.away === false)
+    .map(([p]) => p);
+
+  console.log(`  helper       ${pid ? `running (pid ${pid})` : 'NOT running'}`);
+  console.log(`  at login     ${isAutostartInstalled() ? 'registered' : 'not registered'}`);
+  console.log(`  away on      ${awayProjects.length ? awayProjects.join(', ') : '(none — the app toggle decides)'}`);
+  if (askProjects.length) console.log(`  always ask   ${askProjects.join(', ')}`);
+  if (Array.isArray(config.awayDirs) && config.awayDirs.length) {
+    console.log(`  may run in   ${config.awayDirs.join(', ')}`);
+  }
+  console.log(`  log          ${LOG_FILE}`);
+  console.log('');
+  console.log('  The app\'s Settings toggle is the default for projects without an override.');
+  console.log('  /callme away on   (in a project) opts it in on this machine.');
+  console.log('');
+}
+
 switch (cmd) {
   case 'status':
   case undefined:
     status();
+    break;
+
+  case 'away':
+    await away(args[0] ?? 'status');
     break;
 
   case 'doctor':
@@ -559,6 +671,6 @@ switch (cmd) {
 
   default:
     console.error(`  unknown command: ${cmd}`);
-    console.error('  try: link | status | once | on | off | threshold | quiet | pair | upgrade | doctor');
+    console.error('  try: link | status | once | on | off | away | threshold | quiet | pair | upgrade | doctor');
     process.exit(1);
 }

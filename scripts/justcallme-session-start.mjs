@@ -132,7 +132,9 @@ try {
 // so you're the one who can act on them — claim them and hand them over.
 try {
   if (API_URL && API_KEY) {
-    const res = await fetch(`${API_URL}/calls/pending-replies`, {
+    // mode=ask: only instructions waiting for the user. Away-mode work belongs
+    // to the listener daemon and must not be double-claimed here.
+    const res = await fetch(`${API_URL}/calls/pending-replies?mode=ask`, {
       headers: { authorization: `Bearer ${API_KEY}` },
       signal: AbortSignal.timeout(6000),
     });

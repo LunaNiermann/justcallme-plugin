@@ -43,35 +43,63 @@
  */
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { checkChainDepth, checkCwd, parseAllowedDirs } from './lib/guards.mjs';
 import { resolveClaudeBin } from './lib/claude-bin.mjs';
+import { loadConfig } from './lib/config.mjs';
 import { resolveCreds } from './lib/creds.mjs';
+import { PID_FILE } from './lib/daemon.mjs';
 import { commitWork, createWorktree, isGitRepo, removeWorktree } from './lib/worktree.mjs';
 
 /** Where finished work is left for you to review when you sit back down. */
 const INBOX = join(homedir(), '.justcallme', 'inbox');
 
-// Env wins; ~/.justcallme/config.json (written by `/callme pair`) is the fallback.
+// Env wins; ~/.justcallme/config.json (written by `/callme pair` and
+// `/callme away on`) is the fallback for everything, so the managed daemon
+// needs no environment at all.
+const fileConfig = loadConfig();
 const { apiUrl: API_URL, apiKey: API_KEY } = resolveCreds();
 const POLL_SECONDS = Number(process.env.JUSTCALLME_POLL_SECONDS ?? 5);
 const MAX_CHAIN = Number(process.env.JUSTCALLME_MAX_CHAIN ?? 5);
 // On Windows the CLI lives inside the desktop app under a versioned folder and is
 // not on PATH, so we discover the newest install rather than trusting a bare name.
 const { bin: CLAUDE_BIN, useShell: CLAUDE_USE_SHELL, source: CLAUDE_SOURCE } = resolveClaudeBin();
-const EXTRA_ARGS = (process.env.JUSTCALLME_CLAUDE_ARGS ?? '').trim();
+// `/callme away on` writes claudeArgs ('--permission-mode acceptEdits') into the
+// config — visible, documented, editable. Env still overrides.
+const EXTRA_ARGS = (process.env.JUSTCALLME_CLAUDE_ARGS ?? fileConfig.claudeArgs ?? '').trim();
 const DRY_RUN = process.argv.includes('--dry-run');
 
-/** Optional hard allowlist of directories the listener may run in. See lib/guards.mjs. */
-const ALLOWED_DIRS = parseAllowedDirs(process.env.JUSTCALLME_ALLOWED_DIRS);
+/** Hard allowlist of directories the listener may run in. `/callme away on`
+ *  adds that project's directory; env overrides outright. See lib/guards.mjs. */
+const ALLOWED_DIRS = process.env.JUSTCALLME_ALLOWED_DIRS
+  ? parseAllowedDirs(process.env.JUSTCALLME_ALLOWED_DIRS)
+  : Array.isArray(fileConfig.awayDirs)
+    ? fileConfig.awayDirs
+    : [];
 
 if (!API_URL || !API_KEY) {
   console.error('No API credentials. Set JUSTCALLME_API_URL / JUSTCALLME_API_KEY, or pair');
   console.error('this machine with:  node hooks/justcallme.mjs pair');
   process.exit(1);
 }
+
+// The pidfile is how `/callme away status` (and stop) find us. Best-effort
+// cleanup on the way out; a stale file is healed by the next liveness probe.
+try {
+  writeFileSync(PID_FILE, String(process.pid));
+} catch {
+  /* a read-only home dir shouldn't stop the listener */
+}
+const removePid = () => {
+  try {
+    unlinkSync(PID_FILE);
+  } catch {
+    /* already gone */
+  }
+};
+process.on('exit', removePid);
 
 const ts = () => new Date().toLocaleTimeString();
 const log = (...args) => console.log(`[${ts()}]`, ...args);
@@ -246,7 +274,11 @@ async function tick() {
   running = true;
 
   try {
-    const { pending } = await apiGet('/calls/pending-replies');
+    // mode=auto: ONLY instructions the user gave under away mode. Ask-mode
+    // instructions wait for the SessionStart hook — this daemon must never
+    // run something the user expected to review first. The poll doubles as
+    // the heartbeat the app shows as "helper online".
+    const { pending } = await apiGet('/calls/pending-replies?mode=auto');
 
     for (const item of pending) {
       // In dry-run, don't re-announce something we've already printed this run.

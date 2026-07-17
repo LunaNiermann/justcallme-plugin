@@ -55,6 +55,13 @@ asked for `status`.
   design: if the user explicitly armed a call thirty seconds ago, waking them is the
   entire point.
 - **`status`** — what's currently armed, on, and thresholded.
+- **`away on|off|clear|status`** — "do it while I'm away", per project. `away on` in a
+  project means instructions confirmed on a call from it run unattended on this
+  machine, in an isolated worktree on a justcallme/* branch (never merged or pushed),
+  and it starts + registers the helper daemon at login so nothing needs babysitting.
+  `away off` pins the project to always-wait; `clear` removes the override (the app's
+  toggle decides); `status` shows whether the helper is alive. If the user says "let
+  it work while I'm gone" or "run things while I'm away", run `away on`.
 - **`pair`** — just the QR pairing step, without the first-run checks. Use `link`
   unless the user specifically asks to re-pair.
 - **`upgrade`** — for when you've used up your free minutes. Prints a personal,

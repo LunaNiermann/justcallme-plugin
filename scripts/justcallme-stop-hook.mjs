@@ -137,6 +137,11 @@ const summary = truncateForSpeech(forSpeech(lastAssistantText));
 // down (that turn will arm its own watcher when it's genuinely done). If nothing
 // happens for the whole window, the session is idle — and *that's* when the phone
 // rings. See justcallme-settle.mjs.
+// Per-project away override: `/callme away on|off` in a project stores
+// projects[x].away in the config, and it beats the account-wide toggle from
+// the app. Absent = no opinion, the profile decides.
+const awayFlag = config.projects?.[project]?.away;
+
 const body = {
   task_summary: summary,
   chain_depth: CHAIN_DEPTH,
@@ -148,6 +153,8 @@ const body = {
     duration_seconds: turnSeconds,
     session_seconds: sessionSeconds,
     source: 'claude-code-stop-hook',
+    ...(awayFlag === true ? { execution_mode: 'auto' } : {}),
+    ...(awayFlag === false ? { execution_mode: 'ask' } : {}),
   },
 };
 
