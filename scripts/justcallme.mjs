@@ -87,15 +87,39 @@ function status() {
  * registered. This asks.
  */
 async function doctor() {
-  const { apiUrl: url, apiKey: key, source } = resolveCreds();
+  const envCreds = resolveCreds();
+  const fileCreds = resolveCreds({ ignoreEnv: true });
 
   const ok = (m) => console.log(`  [OK]   ${m}`);
   const bad = (m) => console.log(`  [FAIL] ${m}`);
+  const warn = (m) => console.log(`  [warn] ${m}`);
 
   console.log('');
 
+  const url = envCreds.apiUrl ?? fileCreds.apiUrl;
   if (!url) return bad('no API URL — set JUSTCALLME_API_URL or run: justcallme.mjs pair'), console.log('');
-  ok(`API URL: ${url} (from ${source})`);
+  ok(`API URL: ${url} (from ${envCreds.source})`);
+
+  // Try the env key first (it's what wins at runtime), but don't stop there: a
+  // stale exported key sitting in front of a healthy paired key is the most
+  // common broken state, and doctor's whole job is telling those two apart.
+  let key = envCreds.apiKey;
+  if (key && fileCreds.apiKey && fileCreds.apiKey !== key) {
+    try {
+      const res = await fetch(`${url}/keys/verify`, {
+        headers: { authorization: `Bearer ${key}` },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (res.status === 401) {
+        warn('the key in your ENVIRONMENT is dead; the paired key in config.json is used instead');
+        warn('(clear JUSTCALLME_API_KEY from your shell/profile to silence this)');
+        key = fileCreds.apiKey;
+      }
+    } catch {
+      /* API unreachable — the main check below will say so */
+    }
+  }
+  key ??= fileCreds.apiKey;
 
   if (!key) return bad('no API key — set JUSTCALLME_API_KEY or run: justcallme.mjs pair'), console.log('');
   if (!key.startsWith('jcm_')) return bad('JUSTCALLME_API_KEY does not look like a jcm_ key'), console.log('');
