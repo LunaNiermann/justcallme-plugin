@@ -45,7 +45,7 @@
 import { spawn } from 'node:child_process';
 import { mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { checkChainDepth, checkCwd, parseAllowedDirs } from './lib/guards.mjs';
 import { resolveClaudeBin } from './lib/claude-bin.mjs';
 import { loadConfig } from './lib/config.mjs';
@@ -73,13 +73,21 @@ const { bin: CLAUDE_BIN, useShell: CLAUDE_USE_SHELL, source: CLAUDE_SOURCE } = r
 const EXTRA_ARGS = (process.env.JUSTCALLME_CLAUDE_ARGS ?? fileConfig.claudeArgs ?? '').trim();
 const DRY_RUN = process.argv.includes('--dry-run');
 
-/** Hard allowlist of directories the listener may run in. `/callme away on`
- *  adds that project's directory; env overrides outright. See lib/guards.mjs. */
-const ALLOWED_DIRS = process.env.JUSTCALLME_ALLOWED_DIRS
-  ? parseAllowedDirs(process.env.JUSTCALLME_ALLOWED_DIRS)
-  : Array.isArray(fileConfig.awayDirs)
-    ? fileConfig.awayDirs
-    : [];
+/** Hard allowlist of directories the listener may run in. `/callme away on` adds a
+ *  project's directory; env overrides outright. See lib/guards.mjs.
+ *
+ *  Re-read on EVERY poll rather than once at startup. A daemon that cached the list at
+ *  boot would keep refusing a project you just opted in (the exact bug that dropped a
+ *  callback on the floor), and — worse — would keep RUNNING in a project you just opted
+ *  OUT of. Reading the small config file every few seconds is free; a stale allowlist
+ *  is not. Env still pins it when set. */
+function currentAllowedDirs() {
+  if (process.env.JUSTCALLME_ALLOWED_DIRS) {
+    return parseAllowedDirs(process.env.JUSTCALLME_ALLOWED_DIRS);
+  }
+  const cfg = loadConfig();
+  return Array.isArray(cfg.awayDirs) ? cfg.awayDirs.map((d) => resolve(d)) : [];
+}
 
 if (!API_URL || !API_KEY) {
   console.error('No API credentials. Set JUSTCALLME_API_URL / JUSTCALLME_API_KEY, or pair');
@@ -127,6 +135,20 @@ async function apiPost(path) {
   if (res.status === 409) return null;
   if (!res.ok) throw new Error(`POST ${path} → ${res.status} ${await res.text()}`);
   return res.json();
+}
+
+/** POST a JSON body. Used for the project heartbeat and run status — all fire-and-forget
+ *  telemetry that must NEVER disturb the run, so callers .catch() it. Returns null on the
+ *  204s these endpoints send. */
+async function apiPostJson(path, body) {
+  const res = await fetch(`${API_URL}${path}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) throw new Error(`POST ${path} → ${res.status}`);
+  return res.status === 204 ? null : res.json().catch(() => null);
 }
 
 /** GET that returns null on 404 instead of throwing — used by the dry-run preview,
@@ -245,6 +267,11 @@ async function runInstruction({ instruction, cwd, project, chainDepth, callId, c
   log(`▶ ${tree.branch}`);
   log(`  "${instruction}"`);
 
+  // Mark it running so the app can show "Running — started just now" for this project.
+  apiPostJson('/internal/runs/start', { call_session_id: callId, project, instruction }).catch(
+    () => {},
+  );
+
   const { code, output } = await runClaude({
     instruction,
     dir: tree.dir,
@@ -268,6 +295,17 @@ async function runInstruction({ instruction, cwd, project, chainDepth, callId, c
   } else {
     log(`  ✓ done, but nothing changed (exit ${code})`);
   }
+
+  // Close out the run for the app's status: done (changed), empty (clean exit, no
+  // change), or failed (non-zero exit with nothing to show). Best-effort.
+  const runStatus = result.changed ? 'done' : code === 0 ? 'empty' : 'failed';
+  apiPostJson('/internal/runs/finish', {
+    call_session_id: callId,
+    status: runStatus,
+    branch: tree.branch,
+    changed: result.changed,
+    summary: output || null,
+  }).catch(() => {});
 
   // One timestamp, shared by the inbox record and the summary window, so they never
   // disagree about when this finished.
@@ -354,11 +392,28 @@ let running = false;
  *  once, not once every POLL_SECONDS forever. */
 const previewed = new Set();
 
+/** Instruction ids we've refused and already warned about. A refused reply is left in
+ *  the queue (not claimed), so without this it would re-toast every single poll. Cleared
+ *  when it finally runs, so if you fix the cause it warns you again only if it re-breaks. */
+const refusedNotified = new Set();
+
 async function tick() {
   if (running) return; // still working on the last one
   running = true;
 
   try {
+    // The allowlist, fresh every poll (see currentAllowedDirs) — so opting a project
+    // in or out takes effect immediately, without restarting the daemon.
+    const allowedDirs = currentAllowedDirs();
+
+    // Heartbeat the projects we serve, so the app can list them ("Call a project") with
+    // a live "synced Xm ago". Fire-and-forget; a failed heartbeat must never delay a poll.
+    if (!DRY_RUN && allowedDirs.length) {
+      apiPostJson('/projects/heartbeat', {
+        projects: allowedDirs.map((dir) => ({ name: basename(dir), dir })),
+      }).catch(() => {});
+    }
+
     // mode=auto: ONLY instructions the user gave under away mode. Ask-mode
     // instructions wait for the SessionStart hook — this daemon must never
     // run something the user expected to review first. The poll doubles as
@@ -366,48 +421,73 @@ async function tick() {
     const { pending } = await apiGet('/calls/pending-replies?mode=auto');
 
     for (const item of pending) {
-      // In dry-run, don't re-announce something we've already printed this run.
-      if (DRY_RUN && previewed.has(item.id)) continue;
+      // PREVIEW first — a read that does NOT consume the one-shot reply. We decide
+      // whether we may run it BEFORE claiming. This is the safety fix: the guards
+      // (allowlist, git repo, chain depth) all need task_meta.cwd, which only the reply
+      // carries — so the old code claimed (consumed) and THEN checked, and a refused
+      // instruction was burned. Now a refusal leaves it in the queue, ready to run the
+      // moment you fix the cause.
+      const preview = await apiGetOrNull(`/calls/${item.id}/reply/preview`);
+      if (!preview) continue; // already consumed, or gone
 
-      // A dry run must NEVER consume the instruction. It PREVIEWS (a read that
-      // leaves reply_consumed_at untouched) so you can watch what it would do and
-      // then run it for real. Claiming here would silently burn the instruction --
-      // the reply is one-shot -- which is exactly the bug this avoids.
-      // The real path CLAIMS: claim first, run second. If we crashed between reading
-      // and running the instruction would be lost, but running a mis-heard sentence
-      // twice is far worse than zero times, so at-most-once it is.
-      const got = DRY_RUN
-        ? await apiGetOrNull(`/calls/${item.id}/reply/preview`)
-        : await apiPost(`/calls/${item.id}/reply/claim`);
-      if (!got) continue; // somebody else got it (claim 409), or nothing to preview
-      if (DRY_RUN) previewed.add(item.id);
-
-      const { instruction, task_meta, chain_depth } = got;
+      const { instruction, task_meta, chain_depth } = preview;
       const cwd = task_meta?.cwd;
 
-      const tooDeep = checkChainDepth(chain_depth, MAX_CHAIN);
-      if (tooDeep) {
-        log(`⛔ ${tooDeep}. Not running: "${instruction.slice(0, 60)}…"`);
-        log('   Raise the ceiling, or run it yourself — this is the runaway guard.');
+      // First reason wins. checkCwd verifies the dir exists before we probe it for git.
+      const reason =
+        checkCwd(cwd, allowedDirs) ||
+        (!isGitRepo(cwd)
+          ? `${cwd} is not a git repository — unattended work only runs on a branch`
+          : null) ||
+        checkChainDepth(chain_depth, MAX_CHAIN);
+
+      if (reason) {
+        // Tell you ONCE. A silent refusal after you asked for a call-back is the whole
+        // bug we're closing. We do NOT claim, so it stays in the queue: fix the cause —
+        // e.g. `/callme away on` in that project — and the next poll picks it up.
+        if (!refusedNotified.has(item.id)) {
+          refusedNotified.add(item.id);
+          log(`⛔ NOT running "${instruction.slice(0, 60)}…": ${reason}`);
+          notifyDesktop(
+            'Just Call Me — instruction NOT run',
+            `"${instruction.slice(0, 100)}"\n${reason}\n` +
+              `It's still queued — fix it (e.g. /callme away on in that project) and it'll run.`,
+          );
+        }
         continue;
       }
 
-      const problem = checkCwd(cwd, ALLOWED_DIRS);
-      if (problem) {
-        log(`⛔ refusing to run: ${problem}`);
-        log(`   The instruction was: "${instruction}"`);
+      // Cleared to run. In dry-run we only ANNOUNCE (never claim, never execute), once.
+      if (DRY_RUN) {
+        if (previewed.has(item.id)) continue;
+        previewed.add(item.id);
+        await runInstruction({
+          instruction,
+          cwd,
+          project: task_meta?.project ?? 'unknown',
+          chainDepth: chain_depth,
+          callId: item.id,
+          callbackWhenDone: task_meta?.callback_when_done,
+        });
         continue;
       }
+
+      // Real path: CLAIM (atomic, one-shot) now that we know we can honour it. If a
+      // stale sibling listener claimed it between our preview and now, claim returns
+      // null (409) and we simply move on.
+      const claimed = await apiPost(`/calls/${item.id}/reply/claim`);
+      if (!claimed) continue;
+      refusedNotified.delete(item.id); // it ran — no longer stuck
 
       await runInstruction({
-        instruction,
-        cwd,
-        project: task_meta?.project ?? 'unknown',
-        chainDepth: chain_depth,
+        instruction: claimed.instruction,
+        cwd: claimed.task_meta?.cwd,
+        project: claimed.task_meta?.project ?? 'unknown',
+        chainDepth: claimed.chain_depth,
         callId: item.id,
         // The user's "call me when it's done?" answer, stashed in task_meta by the API.
         // Only an explicit false suppresses the callback.
-        callbackWhenDone: task_meta?.callback_when_done,
+        callbackWhenDone: claimed.task_meta?.callback_when_done,
       });
     }
   } catch (err) {
@@ -423,8 +503,9 @@ async function tick() {
 log(`justcallme listener up — polling ${API_URL} every ${POLL_SECONDS}s`);
 log(`claude: ${CLAUDE_BIN}  [${CLAUDE_SOURCE}]`);
 if (DRY_RUN) log('DRY RUN: instructions will be printed, not executed.');
-if (ALLOWED_DIRS.length) log(`restricted to: ${ALLOWED_DIRS.join(', ')}`);
-else log('⚠ no JUSTCALLME_ALLOWED_DIRS set — will run in whatever cwd the task came from.');
+const startupDirs = currentAllowedDirs();
+if (startupDirs.length) log(`restricted to: ${startupDirs.join(', ')}  (re-read every poll)`);
+else log('⚠ no allowed dirs set — will run in whatever cwd the task came from.');
 if (!EXTRA_ARGS) {
   log('⚠ no JUSTCALLME_CLAUDE_ARGS — Claude Code will prompt for permission and, with');
   log('  nobody at the keyboard, block. Set --permission-mode acceptEdits for real use.');
