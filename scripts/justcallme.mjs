@@ -22,11 +22,12 @@ import { CONFIG_PATH, inQuietHours, loadConfig, saveConfig } from './lib/config.
 import { resolveCreds, saveCreds } from './lib/creds.mjs';
 import {
   LOG_FILE,
-  installAutostart,
+  ensureRunning,
   isAutostartInstalled,
   isListenerRunning,
-  startListener,
+  isWatchdogRunning,
   stopListener,
+  stopWatchdog,
   uninstallAutostart,
 } from './lib/daemon.mjs';
 import { renderQr } from './lib/qr.mjs';
@@ -497,134 +498,98 @@ async function linkWait() {
 }
 
 /**
- * `away` — "do it while I'm away", per project.
+ * `away` — the background helper's on/off/status.
  *
- *   away on       this project's confirmed instructions run unattended, in an
- *                 isolated worktree on a justcallme/* branch (never merged,
- *                 never pushed). Starts the helper daemon and registers it to
- *                 start at login, so there is no terminal to babysit.
- *   away on --full-auto
- *                 same, but Claude runs shell commands without prompting, so
- *                 command-driven tasks (tests, builds, git) actually complete.
- *                 Powerful and dangerous — see the warning it prints.
- *   away on --safe  go back to edits-only (auto-accept file edits, prompt for
- *                 everything else). The default.
- *   away off      this project always waits for you, whatever the app toggle says
- *   away clear    remove this project's override (the app toggle decides again)
- *   away status   is the helper alive, what's opted in, where the log is
+ * The helper now runs AUTOMATICALLY: every Claude Code session starts it (reviving a
+ * dead one), registers the project, and — on Windows — starts the watchdog that revives
+ * it if it crashes. There is nothing to opt in to per project any more, so this command
+ * shrank to one job: an escape hatch to turn the helper off entirely, and back on.
  *
- * The app's Settings toggle is the account-wide DEFAULT; these are per-project
- * overrides on this machine. Opting a project in also adds its directory to the
- * daemon's allowlist — the listener refuses to run anywhere it wasn't invited.
+ *   away         (or `away status`) is the helper alive, will it survive a login/crash
+ *   away on      undo a previous `off`: run the helper and let sessions keep it running
+ *   away off     stop the helper and stop sessions from resurrecting it (the kill switch)
+ *   away clear   alias of `on` — the app's execution toggle is the real day-to-day dial
+ *
+ * IMPORTANT: none of this decides whether an instruction RUNS unattended — that is the
+ * app's execution toggle (default: wait for you), a separate gate. This only decides
+ * whether the helper process runs at all. Edits-only vs full-auto for the runs it does
+ * do is config.claudeArgs (safe by default; see the listener).
  */
-const SAFE_ARGS = '--permission-mode acceptEdits';
-const FULL_AUTO_ARGS = '--permission-mode bypassPermissions';
 const isFullAuto = (a) => /bypassPermissions/.test(a ?? '');
 const permissionLabel = (a) =>
   isFullAuto(a) ? 'FULL AUTO — runs any command unattended' : 'safe — auto-accepts file edits only';
 
-async function away(sub, rest = []) {
+async function away(sub) {
   const cwd = process.cwd();
 
   console.log('');
 
-  if (sub === 'on') {
-    // Opt in to (or out of) unattended shell commands. A plain `away on` preserves
-    // whatever level you already chose — and defaults to safe when unset — so it never
-    // silently upgrades your permissions. The flags are the only way to change level.
-    const wantFullAuto = rest.includes('--full-auto') || rest.includes('--yolo');
-    const wantSafe = rest.includes('--safe');
-
-    config.projects[project] = { ...(config.projects[project] ?? {}), away: true };
+  if (sub === 'on' || sub === 'clear') {
+    // Re-enable after an `off`. Clear the flag, register this project, and bring the
+    // helper (and watchdog) up now — SessionStart would anyway, but do it immediately.
+    config.helperDisabled = false;
     const dirs = new Set(Array.isArray(config.awayDirs) ? config.awayDirs : []);
     dirs.add(cwd);
     config.awayDirs = [...dirs];
-
-    // The setting that makes unattended runs actually run. Written into the config
-    // where you can see and change it, not hidden in an env. The isolation is the
-    // worktree + branch, and your review is the gate.
-    if (wantFullAuto) config.claudeArgs = FULL_AUTO_ARGS;
-    else if (wantSafe) config.claudeArgs = SAFE_ARGS;
-    else config.claudeArgs ??= SAFE_ARGS;
     saveConfig(config);
 
-    const pid = startListener();
-    const auto = isAutostartInstalled() ? 'already set' : installAutostart();
+    const pid = ensureRunning();
 
-    console.log(`  Away mode ON for '${project}'.`);
+    console.log('  The background helper runs automatically — it is on.');
     console.log('');
-    console.log('  When you confirm an instruction on a call from this project, it runs');
-    console.log('  here unattended — in an isolated copy, on a justcallme/* branch that is');
-    console.log('  never merged or pushed. You review the branch when you are back; the');
-    console.log('  next Claude session here will point you at it.');
+    console.log('  Every session keeps it running and registers the project, so there is');
+    console.log('  nothing to set up. Whether it ACTS on an instruction while you are away is');
+    console.log('  the app\'s execution toggle (default: wait for you) — a separate switch.');
     console.log('');
     console.log(`  helper       running (pid ${pid})`);
-    console.log(`  at login     ${auto}`);
-    console.log(`  may run in   ${config.awayDirs.join(', ')}`);
-    console.log(`  permission   ${permissionLabel(config.claudeArgs)}`);
-    console.log(`  log          ${LOG_FILE}`);
-
-    if (isFullAuto(config.claudeArgs)) {
-      console.log('');
-      console.log('  ⚠ FULL AUTO is on. Claude will run shell commands with NO prompt, from a');
-      console.log('    sentence you spoke into a phone and a speech recogniser heard. The');
-      console.log('    worktree keeps CODE off your real branch — but a command can still touch');
-      console.log('    anything on this machine (delete files, hit the network, spend money). A');
-      console.log('    misheard sentence becomes a command nobody approved. Run  /callme away on');
-      console.log('    --safe  to go back to edits-only.');
+    console.log(`  at login     ${isAutostartInstalled() ? 'registered' : 'not registered'}`);
+    if (process.platform === 'win32') {
+      const wpid = isWatchdogRunning();
+      console.log(`  watchdog     ${wpid ? `running (pid ${wpid}) — restarts the helper if it dies` : 'not running'}`);
     }
+    console.log(`  log          ${LOG_FILE}`);
     console.log('');
     return;
   }
 
-  if (sub === 'off' || sub === 'clear') {
-    if (sub === 'off') {
-      config.projects[project] = { ...(config.projects[project] ?? {}), away: false };
-    } else if (config.projects[project]) {
-      delete config.projects[project].away;
-    }
-    config.awayDirs = (Array.isArray(config.awayDirs) ? config.awayDirs : []).filter(
-      (d) => d !== cwd,
-    );
+  if (sub === 'off') {
+    // The kill switch. Set the flag SessionStart honours, then tear everything down —
+    // watchdog first, or it would just restart the listener we're about to stop.
+    config.helperDisabled = true;
     saveConfig(config);
+    stopWatchdog();
+    const stopped = stopListener();
+    uninstallAutostart();
 
-    console.log(
-      sub === 'off'
-        ? `  Away mode OFF for '${project}' — its instructions always wait for you.`
-        : `  Override cleared for '${project}' — the app's toggle decides again.`,
-    );
-
-    const anyAway = Object.values(config.projects ?? {}).some((r) => r.away === true);
-    if (!anyAway && config.awayDirs.length === 0) {
-      const stopped = stopListener();
-      uninstallAutostart();
-      if (stopped) console.log('  No projects left in away mode — helper stopped and unregistered.');
-    }
+    console.log('  Background helper OFF.');
+    console.log('');
+    console.log(`  ${stopped ? 'Stopped it and unregistered' : 'It was not running; unregistered'} login start-up.`);
+    console.log('  Sessions will NOT bring it back. You will not get "do it while I\'m away"');
+    console.log('  runs, and the app cannot ring your projects, until you turn it back on.');
+    console.log('');
+    console.log('  Turn it back on:  /callme away on');
     console.log('');
     return;
   }
 
   // status (default)
   const pid = isListenerRunning();
-  const awayProjects = Object.entries(config.projects ?? {})
-    .filter(([, r]) => r.away === true)
-    .map(([p]) => p);
-  const askProjects = Object.entries(config.projects ?? {})
-    .filter(([, r]) => r.away === false)
-    .map(([p]) => p);
+  const disabled = config.helperDisabled === true;
 
-  console.log(`  helper       ${pid ? `running (pid ${pid})` : 'NOT running'}`);
+  console.log(`  helper       ${disabled ? 'OFF (you disabled it — /callme away on)' : pid ? `running (pid ${pid})` : 'NOT running (a session will start it)'}`);
   console.log(`  at login     ${isAutostartInstalled() ? 'registered' : 'not registered'}`);
-  console.log(`  away on      ${awayProjects.length ? awayProjects.join(', ') : '(none — the app toggle decides)'}`);
-  if (askProjects.length) console.log(`  always ask   ${askProjects.join(', ')}`);
-  if (Array.isArray(config.awayDirs) && config.awayDirs.length) {
-    console.log(`  may run in   ${config.awayDirs.join(', ')}`);
+  if (process.platform === 'win32') {
+    const wpid = isWatchdogRunning();
+    console.log(`  watchdog     ${wpid ? `running (pid ${wpid})` : 'not running'}`);
   }
-  if (config.claudeArgs) console.log(`  permission   ${permissionLabel(config.claudeArgs)}`);
+  if (Array.isArray(config.awayDirs) && config.awayDirs.length) {
+    console.log(`  serves       ${config.awayDirs.map((d) => basename(d)).join(', ')}`);
+  }
+  console.log(`  permission   ${permissionLabel(config.claudeArgs)}`);
   console.log(`  log          ${LOG_FILE}`);
   console.log('');
-  console.log('  The app\'s Settings toggle is the default for projects without an override.');
-  console.log('  /callme away on   (in a project) opts it in on this machine.');
+  console.log('  The helper runs automatically. Whether it ACTS while you\'re away is the');
+  console.log('  app\'s execution toggle. /callme away off is the kill switch.');
   console.log('');
 }
 
@@ -635,7 +600,7 @@ switch (cmd) {
     break;
 
   case 'away':
-    await away(args[0] ?? 'status', args.slice(1));
+    await away(args[0] ?? 'status');
     break;
 
   case 'doctor':

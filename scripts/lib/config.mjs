@@ -42,6 +42,22 @@ const DEFAULTS = {
    * rules say". Set by `/callme once`, cleared as soon as it fires.
    */
   once: null,
+  /**
+   * Keep the machine awake while the listener is serving a project, so a laptop lid
+   * or an idle-sleep timer can't swallow a call. True by default; set false for a
+   * machine that must be allowed to sleep. Env JUSTCALLME_KEEP_AWAKE overrides.
+   * See hooks/lib/keepawake.mjs.
+   */
+  keepAwake: true,
+  /**
+   * The background helper runs automatically: every Claude session starts it (reviving
+   * a dead one) and registers the project, so there is nothing to set up. This is the
+   * one escape hatch — `/callme away off` sets it, stopping the helper and telling
+   * SessionStart not to bring it back; `/callme away on` clears it. Whether the helper,
+   * once running, actually RUNS an instruction unattended is a SEPARATE gate: the app's
+   * execution toggle (default: wait for you). This flag only decides if it runs at all.
+   */
+  helperDisabled: false,
 };
 
 export function loadConfig() {

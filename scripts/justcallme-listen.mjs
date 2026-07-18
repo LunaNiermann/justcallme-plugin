@@ -50,7 +50,8 @@ import { checkChainDepth, checkCwd, parseAllowedDirs } from './lib/guards.mjs';
 import { resolveClaudeBin } from './lib/claude-bin.mjs';
 import { loadConfig } from './lib/config.mjs';
 import { resolveCreds } from './lib/creds.mjs';
-import { PID_FILE } from './lib/daemon.mjs';
+import { HEARTBEAT_FILE, PID_FILE } from './lib/daemon.mjs';
+import { releaseSystemAwake, syncKeepAwake } from './lib/keepawake.mjs';
 import { notifyDesktop } from './lib/notify-desktop.mjs';
 import { openSummaryWindow } from './lib/summary-window.mjs';
 import { commitWork, createWorktree, isGitRepo, removeWorktree } from './lib/worktree.mjs';
@@ -68,10 +69,28 @@ const MAX_CHAIN = Number(process.env.JUSTCALLME_MAX_CHAIN ?? 5);
 // On Windows the CLI lives inside the desktop app under a versioned folder and is
 // not on PATH, so we discover the newest install rather than trusting a bare name.
 const { bin: CLAUDE_BIN, useShell: CLAUDE_USE_SHELL, source: CLAUDE_SOURCE } = resolveClaudeBin();
-// `/callme away on` writes claudeArgs ('--permission-mode acceptEdits') into the
-// config — visible, documented, editable. Env still overrides.
-const EXTRA_ARGS = (process.env.JUSTCALLME_CLAUDE_ARGS ?? fileConfig.claudeArgs ?? '').trim();
+// How much Claude may do on an unattended run. Order: env override → config.claudeArgs
+// → a SAFE default of edits-only. That default matters: unattended execution is gated by
+// the app's execution toggle (execution_mode=auto), not by any local command, so when an
+// auto instruction arrives we must be able to make progress without a human at the
+// keyboard — but only file edits, inside a throwaway worktree. Shell commands still
+// prompt (and so block, safely). Set config.claudeArgs / JUSTCALLME_CLAUDE_ARGS to
+// '--permission-mode bypassPermissions' to allow commands too (powerful and dangerous).
+const SAFE_CLAUDE_ARGS = '--permission-mode acceptEdits';
+const EXTRA_ARGS = (
+  process.env.JUSTCALLME_CLAUDE_ARGS ??
+  fileConfig.claudeArgs ??
+  SAFE_CLAUDE_ARGS
+).trim();
 const DRY_RUN = process.argv.includes('--dry-run');
+// Hold the machine awake while we're serving a project, so a sleeping laptop can't
+// swallow a call. On by default; JUSTCALLME_KEEP_AWAKE=0 (or "keepAwake": false in
+// config.json) opts out for a machine that must be allowed to sleep. See lib/keepawake.mjs.
+const KEEP_AWAKE = (() => {
+  const env = process.env.JUSTCALLME_KEEP_AWAKE;
+  if (env != null) return !/^(0|false|off|no)$/i.test(env.trim());
+  return fileConfig.keepAwake !== false;
+})();
 
 /** Hard allowlist of directories the listener may run in. `/callme away on` adds a
  *  project's directory; env overrides outright. See lib/guards.mjs.
@@ -102,12 +121,36 @@ try {
 } catch {
   /* a read-only home dir shouldn't stop the listener */
 }
+
+/** The liveness beacon daemon.mjs (and the watchdog through it) judge us by. Rewritten at
+ *  startup and every poll, so a recycled PID can never make a dead daemon look alive. */
+const touchHeartbeat = () => {
+  try {
+    writeFileSync(HEARTBEAT_FILE, String(Date.now()));
+  } catch {
+    /* best-effort — a missed beat just risks one spurious restart, never a crash */
+  }
+};
+touchHeartbeat();
 const removePid = () => {
   try {
     unlinkSync(PID_FILE);
   } catch {
     /* already gone */
   }
+  // Remove the heartbeat on a CLEAN exit so liveness is accurate immediately — otherwise
+  // a just-stopped listener would look alive for up to HEARTBEAT_STALE_MS. A crash skips
+  // this handler, which is exactly right: the beat simply goes stale and the watchdog
+  // notices and restarts.
+  try {
+    unlinkSync(HEARTBEAT_FILE);
+  } catch {
+    /* already gone */
+  }
+  // Drop the wake lock on a clean exit right away. (The helper is bound to our pid and
+  // would self-release anyway, so this is belt-and-suspenders — but a crash relies on
+  // that binding, so the binding is the real guarantee, not this line.)
+  releaseSystemAwake();
 };
 process.on('exit', removePid);
 
@@ -398,6 +441,9 @@ const previewed = new Set();
 const refusedNotified = new Set();
 
 async function tick() {
+  touchHeartbeat(); // proof-of-life on every poll — BEFORE the running-guard, so a long
+                    // unattended run (when tick returns early) still keeps the beat fresh
+                    // and the watchdog doesn't mistake a busy listener for a dead one.
   if (running) return; // still working on the last one
   running = true;
 
@@ -405,6 +451,12 @@ async function tick() {
     // The allowlist, fresh every poll (see currentAllowedDirs) — so opting a project
     // in or out takes effect immediately, without restarting the daemon.
     const allowedDirs = currentAllowedDirs();
+
+    // Hold the machine awake exactly while we're actually serving something. Armed
+    // (a dir is opted in) → keep it awake so polling and inbound calls survive an
+    // idle timer. Nothing armed → let it sleep like any other idle machine. Re-run
+    // every poll so it tracks arming without a restart. Never in dry-run.
+    if (KEEP_AWAKE) syncKeepAwake(!DRY_RUN && allowedDirs.length > 0);
 
     // Heartbeat the projects we serve, so the app can list them ("Call a project") with
     // a live "synced Xm ago". Fire-and-forget; a failed heartbeat must never delay a poll.
@@ -506,10 +558,16 @@ if (DRY_RUN) log('DRY RUN: instructions will be printed, not executed.');
 const startupDirs = currentAllowedDirs();
 if (startupDirs.length) log(`restricted to: ${startupDirs.join(', ')}  (re-read every poll)`);
 else log('⚠ no allowed dirs set — will run in whatever cwd the task came from.');
-if (!EXTRA_ARGS) {
-  log('⚠ no JUSTCALLME_CLAUDE_ARGS — Claude Code will prompt for permission and, with');
-  log('  nobody at the keyboard, block. Set --permission-mode acceptEdits for real use.');
-}
+log(
+  KEEP_AWAKE
+    ? 'keep-awake: on while a project is served (JUSTCALLME_KEEP_AWAKE=0 to disable)'
+    : 'keep-awake: off — this machine may sleep and miss calls',
+);
+log(
+  /bypassPermissions/.test(EXTRA_ARGS)
+    ? '⚠ permission: FULL AUTO — Claude runs shell commands unattended (set config.claudeArgs to change)'
+    : `permission: ${EXTRA_ARGS} (edits-only; shell commands still prompt)`,
+);
 
 void tick();
 setInterval(() => void tick(), POLL_SECONDS * 1000);

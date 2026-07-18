@@ -30,6 +30,8 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync } from 'no
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { resolveCreds } from './lib/creds.mjs';
+import { loadConfig, saveConfig } from './lib/config.mjs';
+import { ensureRunning } from './lib/daemon.mjs';
 import { notifyDesktop } from './lib/notify-desktop.mjs';
 import { openSummaryWindow } from './lib/summary-window.mjs';
 
@@ -72,6 +74,29 @@ try {
 const cwd = payload.cwd ?? process.cwd();
 const project = basename(cwd);
 const parts = [];
+
+// --- 0. the helper "just works" --------------------------------------------
+// No /callme away, no setup command: every session we make sure the background helper
+// is running (reviving a dead one) and register THIS project so the helper serves it —
+// the app can then list it under "Call a project", and an away instruction for it can
+// run. Registering only touches the allowlist; whether anything actually RUNS unattended
+// is still gated by the account's execution_mode (default: wait for you). All
+// best-effort — a session must start whether or not any of this succeeds.
+try {
+  const cfg = loadConfig();
+  // `/callme away off` is the one opt-out: honour it and don't resurrect the helper.
+  if (!cfg.helperDisabled) {
+    const dirs = new Set(Array.isArray(cfg.awayDirs) ? cfg.awayDirs : []);
+    if (cwd && !dirs.has(cwd)) {
+      dirs.add(cwd);
+      cfg.awayDirs = [...dirs];
+      saveConfig(cfg);
+    }
+    ensureRunning();
+  }
+} catch {
+  /* the helper is a background nicety; never delay or break a session over it */
+}
 
 // --- 1. work the listener already did --------------------------------------
 try {
