@@ -150,8 +150,12 @@ async function apiGetOrNull(path) {
 const MAX_OUTPUT_CHARS = 8000;
 
 /** Spawn `claude -p` in a directory and wait. Resolves `{ code, output }`, where
- *  `output` is Claude's captured stdout (its final answer). */
-function runClaude({ instruction, dir, project, chainDepth }) {
+ *  `output` is Claude's captured stdout (its final answer).
+ *
+ *  `callbackWhenDone` is the choice the user made on the call ("ring me when it's
+ *  done?"). Only an explicit `false` suppresses the callback — undefined/null keeps the
+ *  default of ringing back (see justcallme-stop-hook.mjs). */
+function runClaude({ instruction, dir, project, chainDepth, callbackWhenDone }) {
   return new Promise((done) => {
     const args = ['-p', instruction, ...(EXTRA_ARGS ? EXTRA_ARGS.split(/\s+/) : [])];
 
@@ -159,6 +163,9 @@ function runClaude({ instruction, dir, project, chainDepth }) {
       cwd: dir,
       env: {
         ...process.env,
+        // The user declined a callback on the call — tell the spawned run's Stop hook
+        // not to ring. Absent = ring when done, exactly as before.
+        ...(callbackWhenDone === false ? { JUSTCALLME_SUPPRESS_CALLBACK: '1' } : {}),
         // The spawned run's own Stop hook reads this and reports it back on /notify,
         // which is how the chain gets counted at all.
         JUSTCALLME_CHAIN_DEPTH: String(chainDepth + 1),
@@ -213,7 +220,7 @@ function runClaude({ instruction, dir, project, chainDepth }) {
  * conclusion Cursor, Jules, Devin, Copilot and Codex all reached: the human review of
  * a diff is what replaces the confirmation you cannot ask for while they're driving.
  */
-async function runInstruction({ instruction, cwd, project, chainDepth, callId }) {
+async function runInstruction({ instruction, cwd, project, chainDepth, callId, callbackWhenDone }) {
   if (!isGitRepo(cwd)) {
     log(`⛔ ${cwd} is not a git repository — refusing to run.`);
     log('   Unattended work only happens on a branch. There is nowhere safe to put it.');
@@ -238,7 +245,13 @@ async function runInstruction({ instruction, cwd, project, chainDepth, callId })
   log(`▶ ${tree.branch}`);
   log(`  "${instruction}"`);
 
-  const { code, output } = await runClaude({ instruction, dir: tree.dir, project, chainDepth });
+  const { code, output } = await runClaude({
+    instruction,
+    dir: tree.dir,
+    project,
+    chainDepth,
+    callbackWhenDone,
+  });
 
   let result = { changed: false, stat: '', sha: null };
   try {
@@ -392,6 +405,9 @@ async function tick() {
         project: task_meta?.project ?? 'unknown',
         chainDepth: chain_depth,
         callId: item.id,
+        // The user's "call me when it's done?" answer, stashed in task_meta by the API.
+        // Only an explicit false suppresses the callback.
+        callbackWhenDone: task_meta?.callback_when_done,
       });
     }
   } catch (err) {

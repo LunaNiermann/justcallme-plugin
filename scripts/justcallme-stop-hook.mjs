@@ -63,6 +63,13 @@ try {
 // because of a Stop hook, don't trigger another one.
 if (payload.stop_hook_active) bail('stop_hook_active — already in a stop hook');
 
+// Set by the away-mode listener when the user declined a callback on the call ("no,
+// don't ring me when it's done"). The work still runs and still commits to a branch;
+// we just don't phone them about it. Absent = ring as usual.
+if (process.env.JUSTCALLME_SUPPRESS_CALLBACK) {
+  bail('callback suppressed for this run — the user declined a call-back on the call');
+}
+
 if (!API_URL || !API_KEY) {
   bail('no API credentials — set JUSTCALLME_API_URL / JUSTCALLME_API_KEY or run `/callme pair`');
 }
