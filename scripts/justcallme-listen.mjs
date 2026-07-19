@@ -48,6 +48,7 @@ import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { checkChainDepth, checkCwd, parseAllowedDirs } from './lib/guards.mjs';
 import { resolveClaudeBin } from './lib/claude-bin.mjs';
+import { resolveCodexBin } from './lib/codex-bin.mjs';
 import { loadConfig } from './lib/config.mjs';
 import { resolveCreds } from './lib/creds.mjs';
 import { HEARTBEAT_FILE, PID_FILE } from './lib/daemon.mjs';
@@ -69,6 +70,9 @@ const MAX_CHAIN = Number(process.env.JUSTCALLME_MAX_CHAIN ?? 5);
 // On Windows the CLI lives inside the desktop app under a versioned folder and is
 // not on PATH, so we discover the newest install rather than trusting a bare name.
 const { bin: CLAUDE_BIN, useShell: CLAUDE_USE_SHELL, source: CLAUDE_SOURCE } = resolveClaudeBin();
+// The Codex CLI, for away-instructions that came from Codex (task_meta.agent === 'codex').
+// Resolved lazily-cheap here; unused if you never drive Codex.
+const { bin: CODEX_BIN, useShell: CODEX_USE_SHELL } = resolveCodexBin();
 // How much Claude may do on an unattended run. Order: env override → config.claudeArgs
 // → a SAFE default of edits-only. That default matters: unattended execution is gated by
 // the app's execution toggle (execution_mode=auto), not by any local command, so when an
@@ -214,47 +218,74 @@ async function apiGetOrNull(path) {
  *  inbox file, so we keep the tail (where the conclusion lands). */
 const MAX_OUTPUT_CHARS = 8000;
 
-/** Spawn `claude -p` in a directory and wait. Resolves `{ code, output }`, where
- *  `output` is Claude's captured stdout (its final answer).
+/** True when the configured permission level is full-auto (shell commands unattended),
+ *  however the user's chosen agent spells it. Both agents share the ONE permission knob
+ *  (EXTRA_ARGS / config.claudeArgs): Claude's `bypassPermissions` and Codex's
+ *  `danger-full-access` are the same intent, so a single flag drives both. */
+const FULL_AUTO = /bypassPermissions|danger-full-access|full-auto|yolo/i.test(EXTRA_ARGS);
+
+/** Build the argv + binary for an agent. Claude: `claude -p <instr> <perm-flags>`.
+ *  Codex: `codex exec --ask-for-approval never --sandbox <level> <instr>`, where the
+ *  sandbox level is the Codex spelling of the same safe/full-auto choice. */
+function agentCommand(agent, instruction) {
+  if (agent === 'codex') {
+    const sandbox = FULL_AUTO ? 'danger-full-access' : 'workspace-write';
+    return {
+      bin: CODEX_BIN,
+      useShell: CODEX_USE_SHELL,
+      // -a never: don't block on approvals unattended. -s: the sandbox = the permission
+      // level. The prompt is a positional arg (no shell → no escaping foot-gun).
+      args: ['exec', '--ask-for-approval', 'never', '--sandbox', sandbox, instruction],
+      envBin: 'JUSTCALLME_CODEX_BIN',
+    };
+  }
+  return {
+    bin: CLAUDE_BIN,
+    useShell: CLAUDE_USE_SHELL,
+    args: ['-p', instruction, ...(EXTRA_ARGS ? EXTRA_ARGS.split(/\s+/) : [])],
+    envBin: 'JUSTCALLME_CLAUDE_BIN',
+  };
+}
+
+/** Spawn the chosen agent in a directory and wait. Resolves `{ code, output }`, where
+ *  `output` is the agent's captured stdout (its final answer). Both `claude -p` and
+ *  `codex exec` print their final message to stdout, which for a question or a blocked
+ *  command is the ONLY result there is — so it has to reach the review handoff.
  *
  *  `callbackWhenDone` is the choice the user made on the call ("ring me when it's
  *  done?"). Only an explicit `false` suppresses the callback — undefined/null keeps the
- *  default of ringing back (see justcallme-stop-hook.mjs). */
-function runClaude({ instruction, dir, project, chainDepth, callbackWhenDone }) {
+ *  default of ringing back (see justcallme-stop-hook.mjs / justcallme-codex-notify.mjs). */
+function runAgent({ agent, instruction, dir, project, chainDepth, callbackWhenDone }) {
   return new Promise((done) => {
-    const args = ['-p', instruction, ...(EXTRA_ARGS ? EXTRA_ARGS.split(/\s+/) : [])];
+    const { bin, useShell, args, envBin } = agentCommand(agent, instruction);
 
-    const child = spawn(CLAUDE_BIN, args, {
+    const child = spawn(bin, args, {
       cwd: dir,
       env: {
         ...process.env,
-        // The user declined a callback on the call — tell the spawned run's Stop hook
-        // not to ring. Absent = ring when done, exactly as before.
+        // The user declined a callback on the call — tell the spawned run's completion
+        // hook (Stop hook / Codex notify) not to ring. Absent = ring when done.
         ...(callbackWhenDone === false ? { JUSTCALLME_SUPPRESS_CALLBACK: '1' } : {}),
-        // The spawned run's own Stop hook reads this and reports it back on /notify,
-        // which is how the chain gets counted at all.
+        // The spawned run's own completion hook reads this and reports it back on /notify,
+        // which is how the chain gets counted at all. (Codex inherits this env and passes
+        // it through to the notify program, so the chain closes for Codex too.)
         JUSTCALLME_CHAIN_DEPTH: String(chainDepth + 1),
         // The hook derives the project from the cwd — which is now a worktree with a
         // slug for a name, not your repo. Without this it would look like an unknown
-        // project and never call you back, which is precisely the call you're waiting
-        // for.
+        // project and never call you back, which is precisely the call you're waiting for.
         JUSTCALLME_PROJECT: project,
-        // A follow-up you explicitly asked for is worth a call however quick it was —
-        // you're waiting for it.
+        // A follow-up you explicitly asked for is worth a call however quick it was.
         JUSTCALLME_MIN_SECONDS: '0',
       },
-      // stdout is PIPED (not inherited) so we can keep Claude's final answer for the
-      // review handoff — a question or a blocked command leaves its result here and
-      // nowhere else. We still echo every chunk to our own stdout, so the daemon log
-      // keeps the full record it always had. stderr stays inherited.
+      // stdout is PIPED (not inherited) so we can keep the agent's final answer for the
+      // review handoff. We still echo every chunk to our own stdout, so the daemon log
+      // keeps the full record. stderr stays inherited.
       stdio: ['ignore', 'pipe', 'inherit'],
-      // A concrete claude.exe path spawns directly (no shell → no arg-escaping
-      // foot-gun). Only a bare-name fallback needs a shell to resolve a .cmd shim.
-      shell: CLAUDE_USE_SHELL,
-      // No flickering console. The daemon is hidden, so a child console app would
-      // otherwise flash its own window open and shut mid-run — confusing, and it told
-      // you nothing. The persistent summary window (opened when the run finishes) is
-      // the deliberate, readable replacement.
+      // A concrete .exe path spawns directly (no shell → no arg-escaping foot-gun); only a
+      // bare-name fallback needs a shell to resolve a .cmd shim.
+      shell: useShell,
+      // No flickering console: the daemon is hidden, and the persistent summary window
+      // (opened when the run finishes) is the deliberate, readable replacement.
       windowsHide: true,
     });
 
@@ -266,8 +297,8 @@ function runClaude({ instruction, dir, project, chainDepth, callbackWhenDone }) 
     });
 
     child.on('error', (err) => {
-      console.error(`  ✗ could not start ${CLAUDE_BIN}: ${err.message}`);
-      console.error('    Set JUSTCALLME_CLAUDE_BIN to the full path of your claude executable.');
+      console.error(`  ✗ could not start ${bin}: ${err.message}`);
+      console.error(`    Set ${envBin} to the full path of your ${agent} executable.`);
       done({ code: 1, output: '' });
     });
     child.on('exit', (code) => done({ code: code ?? 1, output: output.trim() }));
@@ -285,7 +316,7 @@ function runClaude({ instruction, dir, project, chainDepth, callbackWhenDone }) 
  * conclusion Cursor, Jules, Devin, Copilot and Codex all reached: the human review of
  * a diff is what replaces the confirmation you cannot ask for while they're driving.
  */
-async function runInstruction({ instruction, cwd, project, chainDepth, callId, callbackWhenDone }) {
+async function runInstruction({ instruction, cwd, project, chainDepth, callId, callbackWhenDone, agent }) {
   if (!isGitRepo(cwd)) {
     log(`⛔ ${cwd} is not a git repository — refusing to run.`);
     log('   Unattended work only happens on a branch. There is nowhere safe to put it.');
@@ -293,9 +324,10 @@ async function runInstruction({ instruction, cwd, project, chainDepth, callId, c
   }
 
   if (DRY_RUN) {
-    log(`▶ [dry run] would branch from ${cwd} and run:`);
+    const { bin, args } = agentCommand(agent, '<instruction>');
+    log(`▶ [dry run] would branch from ${cwd} and run (${agent}):`);
     log(`  "${instruction}"`);
-    log(`  ${CLAUDE_BIN} -p <instruction> ${EXTRA_ARGS}`);
+    log(`  ${bin} ${args.join(' ')}`);
     return;
   }
 
@@ -315,7 +347,8 @@ async function runInstruction({ instruction, cwd, project, chainDepth, callId, c
     () => {},
   );
 
-  const { code, output } = await runClaude({
+  const { code, output } = await runAgent({
+    agent,
     instruction,
     dir: tree.dir,
     project,
@@ -520,6 +553,7 @@ async function tick() {
           chainDepth: chain_depth,
           callId: item.id,
           callbackWhenDone: task_meta?.callback_when_done,
+          agent: task_meta?.agent === 'codex' ? 'codex' : 'claude',
         });
         continue;
       }
@@ -540,6 +574,9 @@ async function tick() {
         // The user's "call me when it's done?" answer, stashed in task_meta by the API.
         // Only an explicit false suppresses the callback.
         callbackWhenDone: claimed.task_meta?.callback_when_done,
+        // Which CLI to run it with — Codex instructions carry agent:'codex' in task_meta
+        // (set by justcallme-codex-notify.mjs). Everything else defaults to Claude.
+        agent: claimed.task_meta?.agent === 'codex' ? 'codex' : 'claude',
       });
     }
   } catch (err) {

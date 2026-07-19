@@ -53,6 +53,29 @@ you a link + short code (and a QR where it renders) — open it on your phone, t
 New projects don't ring until you `/callme on` them — opt-in, not opt-out, so a
 forgotten script can't call you during dinner.
 
+## Using it with OpenAI Codex
+
+The same phone, the same account — Codex just needs a different trigger (its `notify`
+program instead of a Claude Code hook). Clone this repo, pair once, and add one line.
+
+```bash
+git clone https://github.com/LunaNiermann/justcallme-plugin
+node justcallme-plugin/scripts/justcallme.mjs pair   # links this computer (shared with Claude)
+```
+
+Then in `~/.codex/config.toml`:
+
+```toml
+notify = ["node", "/absolute/path/to/justcallme-plugin/scripts/justcallme-codex-notify.mjs"]
+```
+
+Codex runs it whenever a turn finishes; it reads the turn's final message + duration and
+rings you through the same pipeline. `/callme on|once|threshold|quiet` apply unchanged —
+the rules are shared, so a project armed for Claude is armed for Codex. "Do it while I'm
+away" works too, driving `codex exec`. (Codex has no session-start channel, so the
+"while you were away" handoff shows as the desktop notification + branch, not in-session
+text.)
+
 ## Privacy & safety
 
 - The hook sends the finished task's summary to the Just Call Me service to make
