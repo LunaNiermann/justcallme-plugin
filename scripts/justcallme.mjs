@@ -534,6 +534,9 @@ async function away(sub) {
     saveConfig(config);
 
     const pid = ensureRunning();
+    // ensureRunning() returns a numeric pid normally, but the boolean `true` in the rare
+    // "alive by heartbeat, pidfile gone" case — don't print "pid true".
+    const pidLabel = typeof pid === 'number' ? `pid ${pid}` : 'alive';
 
     console.log('  The background helper runs automatically — it is on.');
     console.log('');
@@ -541,7 +544,7 @@ async function away(sub) {
     console.log('  nothing to set up. Whether it ACTS on an instruction while you are away is');
     console.log('  the app\'s execution toggle (default: wait for you) — a separate switch.');
     console.log('');
-    console.log(`  helper       running (pid ${pid})`);
+    console.log(`  helper       running (${pidLabel})`);
     console.log(`  at login     ${isAutostartInstalled() ? 'registered' : 'not registered'}`);
     if (process.platform === 'win32') {
       const wpid = isWatchdogRunning();

@@ -126,8 +126,7 @@ export function stopListener() {
   if (!pid) return false;
   // isListenerRunning() can return the boolean `true` (fresh heartbeat, but the pidfile
   // vanished) — we know it's alive but not which pid, so we cannot signal it. Only kill a
-  // real number; never let `true` coerce to process.kill(1). The killed listener's exit
-  // handler clears both its pidfile and heartbeat.
+  // real number; never let `true` coerce to process.kill(1).
   if (typeof pid === 'number') {
     try {
       process.kill(pid);
@@ -136,6 +135,11 @@ export function stopListener() {
     }
   }
   try { unlinkSync(PID_FILE); } catch { /* listener may have cleaned up */ }
+  // Clear the heartbeat ourselves. On Windows process.kill() terminates without running
+  // the listener's exit handler, so it would otherwise linger and read "fresh" for up to
+  // HEARTBEAT_STALE_MS — long enough for an immediate restart (or the watchdog) to see a
+  // phantom-alive daemon and refuse to spawn a real one.
+  try { unlinkSync(HEARTBEAT_FILE); } catch { /* already gone */ }
   return true;
 }
 
@@ -158,11 +162,30 @@ export function ensureRunning() {
     /* the watchdog is a nicety; a machine that won't spawn it must not break the session */
   }
   try {
-    if (!isAutostartInstalled()) installAutostart();
+    // Install if missing — OR upgrade a stale entry. An older version's Windows Startup
+    // .vbs launches the LISTENER directly (no watchdog, and no log redirect, so the
+    // daemon runs blind). Rewriting it to the current watchdog-launching form is the only
+    // way those machines ever get supervision; "already installed" is not good enough.
+    if (!isAutostartInstalled() || isAutostartStale()) installAutostart();
   } catch {
     /* autostart is a nicety; a locked-down machine must not break the session */
   }
   return pid;
+}
+
+/**
+ * Does the installed autostart entry launch the OLD listener-directly form instead of the
+ * current watchdog-launching one? Windows only — the macOS/Linux units always supervised,
+ * so there's nothing to upgrade. A missing file is "not stale" (isAutostartInstalled owns
+ * absence); an unreadable one we leave alone rather than churn.
+ */
+function isAutostartStale() {
+  if (process.platform !== 'win32') return false;
+  try {
+    return !readFileSync(WIN_VBS(), 'utf8').includes('justcallme-watchdog');
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
